@@ -356,7 +356,27 @@ body {
       const data = await res.json();
 
       if (data.success) {
+        // ── ORIGINAL LINE (unchanged) ──────────────────────────────────────────
+        // Kept exactly as you had it — stores username + age
         localStorage.setItem('ospectra_user', JSON.stringify({ username: email, age: data.age }));
+
+        // ── ADDED: fire ospTrack with real name + email ────────────────────────
+        // Derives a clean display name from the email prefix:
+        // "avinash.govindharaju@ospectra.ai" → "Avinash Govindharaju"
+        if (window.ospTrack) {
+          const displayName = email
+            .split('@')[0]
+            .replace(/[._-]+/g, ' ')
+            .replace(/\b\w/g, function(c) { return c.toUpperCase(); });
+
+          window.ospTrack('user_login', {
+            element:      'Login Form',
+            email:        email,
+            visitor_name: displayName,
+          });
+        }
+        // ── END ADDED ──────────────────────────────────────────────────────────
+
         showAlert('Login successful! Redirecting…', 'success');
         setTimeout(() => { window.location.href = 'index.html'; }, 1000);
       } else {

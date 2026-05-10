@@ -471,23 +471,89 @@ window.addEventListener('popstate', updateActiveNavLink);
     send('page_exit', { element: window.location.pathname });
   });
 
+  // ═══════════════════════════════════════════════════════════════
+// REPLACE the "── 9. Login tracking ──" section in your shared.js
+// with this version. It reads name + email + company properly.
+// ═══════════════════════════════════════════════════════════════
+
   // ── 9. Login tracking ─────────────────────────────────────────
+  // Watches localStorage for 'ospectra_user' being set.
+  // Now reads: name (real display name), email, company — not just username.
   const _origSetItem = localStorage.setItem.bind(localStorage);
   localStorage.setItem = function(key, value) {
     _origSetItem(key, value);
     if (key === 'ospectra_user') {
       try {
         const user = JSON.parse(value);
-        if (user && user.username) {
+        if (!user) return;
+
+        // ✅ Read real name — priority: name > username prefix
+        const displayName = user.name
+          || (user.username
+                ? user.username.split('@')[0]
+                    .replace(/[._-]+/g, ' ')
+                    .replace(/\b\w/g, c => c.toUpperCase())
+                : null);
+
+        // ✅ Read email — explicit field or fall back to username
+        const email = user.email || user.username || null;
+
+        // ✅ Read company if stored
+        const company = user.company || null;
+
+        if (email || displayName) {
           send('user_login', {
             element:      'Login',
-            email:        user.username,
-            visitor_name: user.username.split('@')[0],
+            email:        email,
+            visitor_name: displayName,
+            // company goes into extra so backend can pick it up
+            company:      company,
           });
+          console.log('[osp] user_login fired →', displayName, email, company);
         }
-      } catch(e) {}
+      } catch(e) {
+        console.warn('[osp] login tracking parse error', e);
+      }
     }
   };
+
+// ═══════════════════════════════════════════════════════════════
+// Also add this at the TOP of shared.js IIFE, after getVid():
+// This fires on page load if the user is ALREADY logged in
+// (so returning visitors are identified immediately, not just on login)
+// ═══════════════════════════════════════════════════════════════
+
+  // ── 0. Identify already-logged-in user on every page load ─────
+  (function identifyExistingUser() {
+    try {
+      const stored = localStorage.getItem('ospectra_user');
+      if (!stored) return;
+      const user = JSON.parse(stored);
+      if (!user) return;
+
+      const displayName = user.name
+        || (user.username
+              ? user.username.split('@')[0]
+                  .replace(/[._-]+/g, ' ')
+                  .replace(/\b\w/g, c => c.toUpperCase())
+              : null);
+      const email   = user.email || user.username || null;
+      const company = user.company || null;
+
+      if (email || displayName) {
+        // Fire after a short delay so page_view fires first
+        setTimeout(function() {
+          send('user_identified', {
+            element:      'Auto-identified (returning user)',
+            email:        email,
+            visitor_name: displayName,
+            company:      company,
+          });
+          console.log('[osp] auto-identified →', displayName, email);
+        }, 500);
+      }
+    } catch(e) {}
+  })();
 
   // ── 10. FIX 3: Heartbeat ping every 20s ──────────────────────
   // Sends a lightweight ping so the dashboard can show which page
