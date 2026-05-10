@@ -104,6 +104,8 @@ function initializeFAQ() {
 }
 
 // ===== CONTACT FORM =====
+// FIX: now sends email + visitor_name at top level so backend writes them
+// to the visitor row and triggers Apollo enrichment immediately.
 function initializeContactForm() {
   const form       = document.querySelector('.contact-form');
   const submitBtn  = document.querySelector('.contact-form .btn-submit');
@@ -117,7 +119,7 @@ function initializeContactForm() {
       window.ospTrack('form_submit', {
         element:      'Contact Form Submit',
         visitor_name: firstName.value.trim(),
-        email:        email.value.trim(),
+        email:        email.value.trim(),   // ← triggers Apollo match in backend
       });
       form.style.display = 'none';
       if (successMsg) successMsg.classList.add('show');
@@ -134,6 +136,7 @@ function initializeContactForm() {
 }
 
 // ===== DEMO FORM =====
+// FIX: same — email + visitor_name sent at top level.
 function initializeDemoForm() {
   const demoSubmitBtn = document.querySelector('#demo-modal .btn-submit');
   if (!demoSubmitBtn) return;
@@ -145,7 +148,7 @@ function initializeDemoForm() {
       window.ospTrack('form_submit', {
         element:      'Book a Demo Form Submit',
         visitor_name: nameInput.value.trim(),
-        email:        emailInput.value.trim(),
+        email:        emailInput.value.trim(),   // ← triggers Apollo match in backend
       });
       showNotif('Demo request sent! Our team will reach out within 24hrs. 🎯');
       closeDemo();
@@ -247,11 +250,17 @@ window.addEventListener('popstate', updateActiveNavLink);
 
 
 // =============================================================
-// OSPECTRA LEAD TRACKER — shared.js edition
-// FIX 1: Real IP fetched from ipify, sent as top-level field
-// FIX 2: element + email + visitor_name at TOP LEVEL payload
-// FIX 3: Heartbeat ping every 20s so dashboard shows live page
-// FIX 4: visitor_name read correctly from name_captured extra
+// OSPECTRA LEAD TRACKER — shared.js
+// v3 FIXES:
+//   FIX 1: Real IP via ipify, sent as top-level real_ip field
+//   FIX 2: element + email + visitor_name at TOP LEVEL payload
+//   FIX 3: Heartbeat ping every 20s (dashboard live tracking)
+//   FIX 4: visitor_name extracted from name_captured correctly
+//   FIX 5: Login tracking reads user.name / user.full_name first
+//   FIX 6: user_identified fires on every page load for returning
+//           logged-in users → backend re-enriches with email
+//   FIX 7: form_submit and email_captured both carry email at
+//           top level so backend Apollo match triggers every time
 // =============================================================
 (function () {
   'use strict';
@@ -323,10 +332,9 @@ window.addEventListener('popstate', updateActiveNavLink);
     } catch(e) { return 'fp_err_' + Math.random().toString(36).slice(2); }
   }
 
-  // ── FIX 1: Real IP via ipify — fetched once, cached ──────────
-  // The Render proxy swallows request.remote_addr (becomes 127.0.0.1).
-  // We fetch the real public IP from ipify on the CLIENT side and
-  // send it in the payload so the backend can use it for geolocation.
+  // ── FIX 1: Real IP via ipify — fetched once, cached in sessionStorage ────
+  // Render's proxy makes request.remote_addr always 127.0.0.1.
+  // We fetch the real public IP client-side and send it as real_ip.
   let _realIP = null;
   try { _realIP = sessionStorage.getItem('osp_real_ip'); } catch(e) {}
 
@@ -342,9 +350,28 @@ window.addEventListener('popstate', updateActiveNavLink);
       .catch(() => cb(null));
   }
 
-  // ── FIX 2: Core send — all key fields at TOP LEVEL ───────────
-  // Backend reads element, email, visitor_name directly from the
-  // root of the payload — not buried inside extra{}.
+  // ── FIX 5: Helper — extract clean name + email from user object ──────────
+  // Priority: explicit name/full_name field > formatted email prefix.
+  // This runs both on login AND on page load for returning users.
+  function _extractUser(user) {
+    if (!user) return { displayName: null, email: null, company: null };
+    const displayName = user.name
+      || user.full_name
+      || (user.username
+            ? user.username.split('@')[0]
+                .replace(/[._\-]+/g, ' ')
+                .replace(/\b\w/g, function(c) { return c.toUpperCase(); })
+            : null);
+    // Only use username as email if it actually contains @
+    const email = user.email
+      || (user.username && user.username.includes('@') ? user.username : null);
+    const company = user.company || null;
+    return { displayName: displayName, email: email, company: company };
+  }
+
+  // ── FIX 2: Core send — ALL key fields at TOP LEVEL ──────────────────────
+  // The backend (track.py) reads email, visitor_name, element directly from
+  // the root of the payload. Anything buried in extra{} alone gets missed.
   function send(eventType, extra) {
     extra = extra || {};
     const payload = {
@@ -356,11 +383,11 @@ window.addEventListener('popstate', updateActiveNavLink);
       referrer:     document.referrer || null,
       timezone:     Intl.DateTimeFormat().resolvedOptions().timeZone,
       screen:       screen.width + 'x' + screen.height,
-      // ✅ TOP-LEVEL fields the backend reads directly:
+      // ✅ TOP-LEVEL: backend reads these directly off the payload
       element:      extra.element      || null,
-      email:        extra.email        || null,
+      email:        extra.email        || null,   // ← triggers Apollo match when present
       visitor_name: extra.visitor_name || null,
-      // ✅ FIX 1: real IP at top level so backend can geolocate it
+      // ✅ FIX 1: real public IP for geo enrichment
       real_ip:      _realIP            || null,
       extra: Object.assign({
         viewport: window.innerWidth + 'x' + window.innerHeight,
@@ -376,16 +403,42 @@ window.addEventListener('popstate', updateActiveNavLink);
     }).catch(function() {});
   }
 
-  // Expose globally so other scripts can call window.ospTrack(...)
+  // Expose globally so page code can call window.ospTrack(...)
   window.ospTrack = send;
 
-  // ── 1. Fetch real IP first, then fire page_view ───────────────
+  // ── 1. Fetch real IP first, then fire page_view ───────────────────────────
   fetchRealIP(function(ip) {
     _realIP = ip;
     send('page_view');
   });
 
-  // ── 2. Click tracking ─────────────────────────────────────────
+  // ── FIX 6: Identify already-logged-in user on EVERY page load ────────────
+  // If a user logged in on a previous visit, their data is in localStorage.
+  // We fire user_identified 500ms after page_view so the backend writes
+  // their email to the visitor row and re-runs Apollo enrichment.
+  // Without this, returning logged-in users were anonymous until they
+  // explicitly triggered another login event.
+  (function identifyReturningUser() {
+    try {
+      const stored = localStorage.getItem('ospectra_user');
+      if (!stored) return;
+      const user = JSON.parse(stored);
+      if (!user) return;
+      const u = _extractUser(user);
+      if (!u.email && !u.displayName) return;
+      setTimeout(function() {
+        send('user_identified', {
+          element:      'Auto-identified (returning user)',
+          email:        u.email,          // ← backend writes this + runs Apollo match
+          visitor_name: u.displayName,
+          company:      u.company,
+        });
+        console.log('[osp] returning user identified →', u.displayName, u.email);
+      }, 500);
+    } catch(e) {}
+  })();
+
+  // ── 2. Click tracking ─────────────────────────────────────────────────────
   document.addEventListener('click', function(e) {
     const el    = e.target.closest('button, a, [data-track]') || e.target;
     const label = (
@@ -407,7 +460,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   });
 
-  // ── 3. Scroll depth ───────────────────────────────────────────
+  // ── 3. Scroll depth ───────────────────────────────────────────────────────
   const scrollFired = {};
   window.addEventListener('scroll', function() {
     const docH = document.documentElement.scrollHeight;
@@ -418,17 +471,21 @@ window.addEventListener('popstate', updateActiveNavLink);
     });
   }, { passive: true });
 
-  // ── 4. Email capture ──────────────────────────────────────────
+  // ── 4. Email capture — FIX 7: email sent at TOP LEVEL ────────────────────
+  // When a user types into any email input and tabs away, we fire email_captured
+  // with the email at the root of the payload (not just in extra{}).
+  // This causes track.py to immediately write visitor.email and trigger Apollo.
   document.addEventListener('change', function(e) {
     const el = e.target;
     if ((el.type === 'email' || el.name === 'email' || el.id === 'email') && el.value) {
-      send('email_captured', { element: 'Email Field', email: el.value.trim() });
+      send('email_captured', {
+        element: 'Email Field',
+        email:   el.value.trim(),   // ← top-level via send(), triggers Apollo match
+      });
     }
   });
 
-  // ── 5. FIX 4: Name capture — visitor_name at top level ───────
-  // Previously visitor_name was only inside extra{} so the backend
-  // couldn't read it. Now sent at root level too.
+  // ── 5. Name capture ───────────────────────────────────────────────────────
   document.addEventListener('change', function(e) {
     const el = e.target;
     const ph = (el.placeholder || '').toLowerCase();
@@ -438,12 +495,12 @@ window.addEventListener('popstate', updateActiveNavLink);
     ) {
       send('name_captured', {
         element:      'Name Field',
-        visitor_name: el.value.trim(),   // ✅ top-level via send()
+        visitor_name: el.value.trim(),   // ← top-level via send()
       });
     }
   });
 
-  // ── 6. Field focus ────────────────────────────────────────────
+  // ── 6. Field focus ────────────────────────────────────────────────────────
   let focusTimer = null;
   document.addEventListener('focusin', function(e) {
     const el = e.target;
@@ -458,7 +515,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   });
 
-  // ── 7. Time on page ───────────────────────────────────────────
+  // ── 7. Time on page ───────────────────────────────────────────────────────
   const timeFired = {};
   [30, 60, 120].forEach(function(sec) {
     setTimeout(function() {
@@ -466,19 +523,15 @@ window.addEventListener('popstate', updateActiveNavLink);
     }, sec * 1000);
   });
 
-  // ── 8. Page exit ──────────────────────────────────────────────
+  // ── 8. Page exit ──────────────────────────────────────────────────────────
   window.addEventListener('beforeunload', function() {
     send('page_exit', { element: window.location.pathname });
   });
 
-  // ═══════════════════════════════════════════════════════════════
-// REPLACE the "── 9. Login tracking ──" section in your shared.js
-// with this version. It reads name + email + company properly.
-// ═══════════════════════════════════════════════════════════════
-
-  // ── 9. Login tracking ─────────────────────────────────────────
-  // Watches localStorage for 'ospectra_user' being set.
-  // Now reads: name (real display name), email, company — not just username.
+  // ── 9. Login tracking — FIX 5: reads name/full_name before email prefix ──
+  // Watches localStorage for 'ospectra_user' being written (fires on login/signup).
+  // Sends email at top level so backend immediately writes it to visitor row
+  // and triggers Apollo /people/match enrichment.
   const _origSetItem = localStorage.setItem.bind(localStorage);
   localStorage.setItem = function(key, value) {
     _origSetItem(key, value);
@@ -486,30 +539,15 @@ window.addEventListener('popstate', updateActiveNavLink);
       try {
         const user = JSON.parse(value);
         if (!user) return;
-
-        // ✅ Read real name — priority: name > username prefix
-        const displayName = user.name
-          || (user.username
-                ? user.username.split('@')[0]
-                    .replace(/[._-]+/g, ' ')
-                    .replace(/\b\w/g, c => c.toUpperCase())
-                : null);
-
-        // ✅ Read email — explicit field or fall back to username
-        const email = user.email || user.username || null;
-
-        // ✅ Read company if stored
-        const company = user.company || null;
-
-        if (email || displayName) {
+        const u = _extractUser(user);
+        if (u.email || u.displayName) {
           send('user_login', {
             element:      'Login',
-            email:        email,
-            visitor_name: displayName,
-            // company goes into extra so backend can pick it up
-            company:      company,
+            email:        u.email,          // ← THIS causes Apollo match in backend
+            visitor_name: u.displayName,
+            company:      u.company,
           });
-          console.log('[osp] user_login fired →', displayName, email, company);
+          console.log('[osp] user_login fired →', u.displayName, u.email, u.company);
         }
       } catch(e) {
         console.warn('[osp] login tracking parse error', e);
@@ -517,58 +555,19 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   };
 
-// ═══════════════════════════════════════════════════════════════
-// Also add this at the TOP of shared.js IIFE, after getVid():
-// This fires on page load if the user is ALREADY logged in
-// (so returning visitors are identified immediately, not just on login)
-// ═══════════════════════════════════════════════════════════════
-
-  // ── 0. Identify already-logged-in user on every page load ─────
-  (function identifyExistingUser() {
-    try {
-      const stored = localStorage.getItem('ospectra_user');
-      if (!stored) return;
-      const user = JSON.parse(stored);
-      if (!user) return;
-
-      const displayName = user.name
-        || (user.username
-              ? user.username.split('@')[0]
-                  .replace(/[._-]+/g, ' ')
-                  .replace(/\b\w/g, c => c.toUpperCase())
-              : null);
-      const email   = user.email || user.username || null;
-      const company = user.company || null;
-
-      if (email || displayName) {
-        // Fire after a short delay so page_view fires first
-        setTimeout(function() {
-          send('user_identified', {
-            element:      'Auto-identified (returning user)',
-            email:        email,
-            visitor_name: displayName,
-            company:      company,
-          });
-          console.log('[osp] auto-identified →', displayName, email);
-        }, 500);
-      }
-    } catch(e) {}
-  })();
-
-  // ── 10. FIX 3: Heartbeat ping every 20s ──────────────────────
-  // Sends a lightweight ping so the dashboard can show which page
-  // the visitor is CURRENTLY on (last_seen updated every 20s).
-  // Dashboard marks visitor as LIVE if last_seen < 60s ago.
+  // ── 10. Heartbeat ping every 20s — FIX 3 ─────────────────────────────────
+  // Keeps last_seen updated so the dashboard can show who is live right now.
+  // Dashboard marks a visitor as LIVE if last_seen < 60s ago.
   setInterval(function() {
     send('heartbeat', { element: window.location.pathname });
   }, 20000);
 
-  // ── 11. SPA navigation ────────────────────────────────────────
+  // ── 11. SPA navigation ────────────────────────────────────────────────────
   let lastPage = window.location.pathname;
   function checkPageChange() {
     if (window.location.pathname !== lastPage) {
       lastPage = window.location.pathname;
-      scrollFired && Object.keys(scrollFired).forEach(k => delete scrollFired[k]);
+      Object.keys(scrollFired).forEach(function(k) { delete scrollFired[k]; });
       send('page_view');
     }
   }
@@ -579,5 +578,5 @@ window.addEventListener('popstate', updateActiveNavLink);
 
 })();
 // ═══════════════════════════════════════════════════════════════
-// END OF OSPECTRA TRACKER (shared.js)
+// END OF OSPECTRA TRACKER — shared.js v3
 // ═══════════════════════════════════════════════════════════════
