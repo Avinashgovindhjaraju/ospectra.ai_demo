@@ -119,6 +119,10 @@ function initializeContactForm() {
         visitor_name: firstName.value.trim(),
         email:        email.value.trim(),
       });
+      // ✅ iXplane: identify visitor on contact form submit
+      if (window.ixplane) {
+        window.ixplane.identify(email.value.trim(), firstName.value.trim(), { source: 'contact_form' });
+      }
       form.style.display = 'none';
       if (successMsg) successMsg.classList.add('show');
       showNotif("Message sent! We'll get back to you soon. ✅");
@@ -147,6 +151,17 @@ function initializeDemoForm() {
         visitor_name: nameInput.value.trim(),
         email:        emailInput.value.trim(),
       });
+      // ✅ iXplane: demo request = highest intent signal — identify immediately
+      if (window.ixplane) {
+        window.ixplane.identify(emailInput.value.trim(), nameInput.value.trim(), {
+          source: 'demo_request',
+          intent: 'high',
+        });
+        window.ixplane.track('demo_requested', {
+          name:  nameInput.value.trim(),
+          email: emailInput.value.trim(),
+        });
+      }
       showNotif('Demo request sent! Our team will reach out within 24hrs. 🎯');
       closeDemo();
     } else {
@@ -199,6 +214,10 @@ function openDemo() {
   if (modal) {
     modal.classList.add('open');
     document.body.style.overflow = 'hidden';
+    // ✅ iXplane: opening demo modal = strong intent signal
+    if (window.ixplane) {
+      window.ixplane.track('demo_modal_opened', { page: window.location.pathname });
+    }
   }
 }
 
@@ -247,15 +266,129 @@ window.addEventListener('popstate', updateActiveNavLink);
 
 
 // =============================================================
-// OSPECTRA LEAD TRACKER — shared.js v4
-// Enrichment: Hunter.io (email → person + company) + IPinfo (IP → geo)
+// OSPECTRA LEAD TRACKER — shared.js v5
+// Tracking:  Ospectra backend + iXplane intent signals
+// Enrichment: Apollo.io (PRIMARY) + Hunter.io (supplement) + IPinfo (geo)
 // =============================================================
 (function () {
   'use strict';
 
   const API = 'https://tracker-ospectra-ai.onrender.com/api';
 
-  // ── Visitor ID (cookie + localStorage, 1 year) ────────────────
+  // ── iXplane Configuration ──────────────────────────────────────
+  // Your iXplane Project Token — from iXplane dashboard
+  const IXPLANE_TOKEN    = '19d18e9327121ccb5145156fb2b2ec55';
+  const IXPLANE_API_BASE = 'https://api.ixplane.com/v1';
+
+  // ── iXplane: fire event ────────────────────────────────────────
+  // Sends intent signal to iXplane silently — never blocks tracker.
+  function _ixSend(eventName, props) {
+    try {
+      fetch(IXPLANE_API_BASE + '/track', {
+        method:    'POST',
+        headers:   { 'Content-Type': 'application/json' },
+        keepalive: true,
+        body: JSON.stringify({
+          token:      IXPLANE_TOKEN,
+          event:      eventName,
+          visitor_id: getVid(),
+          session_id: getSid(),
+          page:       window.location.pathname,
+          referrer:   document.referrer || null,
+          timestamp:  new Date().toISOString(),
+          properties: Object.assign({
+            url:         window.location.href,
+            title:       document.title,
+            device_type: _DEVICE_TYPE,
+            browser:     _BROWSER,
+            os:          _OS,
+            screen:      screen.width + 'x' + screen.height,
+            timezone:    Intl.DateTimeFormat().resolvedOptions().timeZone,
+            lang:        navigator.language,
+          }, props || {}),
+        }),
+      }).catch(function() {});
+    } catch(e) {}
+  }
+
+  // ── iXplane: identify visitor ──────────────────────────────────
+  // Call when email / name is known — maps anonymous → real person.
+  function _ixIdentify(email, name, extra) {
+    try {
+      fetch(IXPLANE_API_BASE + '/identify', {
+        method:    'POST',
+        headers:   { 'Content-Type': 'application/json' },
+        keepalive: true,
+        body: JSON.stringify({
+          token:      IXPLANE_TOKEN,
+          visitor_id: getVid(),
+          email:      email || null,
+          name:       name  || null,
+          properties: extra || {},
+        }),
+      }).catch(function() {});
+    } catch(e) {}
+  }
+
+  // ✅ Expose globally so your app pages can call directly:
+  //    window.ixplane.track('pricing_viewed', { plan: 'pro' })
+  //    window.ixplane.identify('user@company.com', 'John Doe')
+  window.ixplane = { track: _ixSend, identify: _ixIdentify };
+
+  // ── Device type detection ──────────────────────────────────────
+  // ✅ NEW in v5 — was missing from shared.js v4
+  // Detects: Mobile / Tablet / Laptop / Desktop
+  function _detectDevice() {
+    try {
+      const ua     = navigator.userAgent || '';
+      const w      = screen.width;
+      const maxDim = Math.max(w, screen.height);
+      const minDim = Math.min(w, screen.height);
+      const phoneUA  = /Android.*Mobile|iPhone|iPod|Windows Phone|BlackBerry|Mobile.*Firefox|Opera Mini/i.test(ua);
+      const tabletUA = /iPad|Android(?!.*Mobile)|Tablet|Kindle|Silk|PlayBook/i.test(ua);
+      if (phoneUA && maxDim < 900)   return 'Mobile';
+      if (tabletUA || (navigator.maxTouchPoints > 1 && maxDim >= 600 && maxDim < 1300 && minDim < 900)) return 'Tablet';
+      if (phoneUA)                   return 'Mobile';
+      const hasMouse = window.matchMedia && window.matchMedia('(pointer: fine)').matches;
+      if (hasMouse || !navigator.maxTouchPoints) return w <= 1600 ? 'Laptop' : 'Desktop';
+      if (maxDim >= 1300)            return 'Laptop';
+      return 'Mobile';
+    } catch(e) { return 'Desktop'; }
+  }
+
+  function _detectBrowser() {
+    try {
+      const ua = navigator.userAgent || '';
+      if (/Edg\//.test(ua))           return 'Edge';
+      if (/OPR\/|Opera/.test(ua))     return 'Opera';
+      if (/SamsungBrowser/.test(ua))  return 'Samsung Browser';
+      if (/Chrome\//.test(ua) && !/Chromium/.test(ua)) return /Mobile/.test(ua) ? 'Chrome Mobile' : 'Chrome';
+      if (/Firefox\//.test(ua))       return /Mobile/.test(ua) ? 'Firefox Mobile' : 'Firefox';
+      if (/Safari\//.test(ua) && !/Chrome/.test(ua)) return /Mobile/.test(ua) ? 'Safari Mobile' : 'Safari';
+      return 'Browser';
+    } catch(e) { return 'Browser'; }
+  }
+
+  function _detectOS() {
+    try {
+      const ua = navigator.userAgent || '';
+      if (/Windows NT 10/.test(ua))   return 'Windows 10/11';
+      if (/Windows NT/.test(ua))      return 'Windows';
+      if (/Mac OS X/.test(ua) && !/iPhone|iPad/.test(ua)) return 'macOS';
+      if (/iPhone|iPad/.test(ua))     return 'iOS';
+      if (/Android/.test(ua))         return 'Android';
+      if (/Linux/.test(ua))           return 'Linux';
+      if (/CrOS/.test(ua))            return 'ChromeOS';
+      return navigator.platform || 'Unknown';
+    } catch(e) { return 'Unknown'; }
+  }
+
+  // Detect once and cache — used in every send()
+  const _DEVICE_TYPE = _detectDevice();
+  const _BROWSER     = _detectBrowser();
+  const _OS          = _detectOS();
+
+  // ── Visitor ID (cookie + localStorage, 1 year) ─────────────────
   function getVid() {
     let v = null;
     try { v = localStorage.getItem('osp_vid'); } catch(e) {}
@@ -268,7 +401,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     return v;
   }
 
-  // ── Session ID (sessionStorage, tab-scoped) ───────────────────
+  // ── Session ID (sessionStorage, tab-scoped) ────────────────────
   function getSid() {
     let s = null;
     try { s = sessionStorage.getItem('osp_sid'); } catch(e) {}
@@ -279,7 +412,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     return s;
   }
 
-  // ── Cookie helpers ────────────────────────────────────────────
+  // ── Cookie helpers ─────────────────────────────────────────────
   function _setCookie(name, value, days) {
     try {
       const exp = new Date(Date.now() + days * 86400000).toUTCString();
@@ -293,7 +426,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     } catch(e) { return null; }
   }
 
-  // ── Canvas fingerprint ────────────────────────────────────────
+  // ── Canvas fingerprint ─────────────────────────────────────────
   function getFingerprint() {
     try {
       const c = document.createElement('canvas');
@@ -320,10 +453,10 @@ window.addEventListener('popstate', updateActiveNavLink);
     } catch(e) { return 'fp_err_' + Math.random().toString(36).slice(2); }
   }
 
-  // ── Real IP via ipify ─────────────────────────────────────────
+  // ── Real IP via ipify ──────────────────────────────────────────
   // Render's proxy makes request.remote_addr always 127.0.0.1.
   // We fetch the visitor's real public IP client-side and send it
-  // as real_ip so IPinfo geo enrichment works correctly.
+  // as real_ip so IPinfo + Apollo geo enrichment works correctly.
   let _realIP = null;
   try { _realIP = sessionStorage.getItem('osp_real_ip'); } catch(e) {}
 
@@ -339,9 +472,7 @@ window.addEventListener('popstate', updateActiveNavLink);
       .catch(() => cb(null));
   }
 
-  // ── Extract identity fields from stored user object ───────────
-  // Priority: server-returned name/email > email-prefix fallback.
-  // Server (server.js) now returns name, email, company on login.
+  // ── Extract identity fields from stored user object ────────────
   function _extractUser(user) {
     if (!user) return { displayName: null, email: null, company: null };
     const displayName = user.name
@@ -351,35 +482,44 @@ window.addEventListener('popstate', updateActiveNavLink);
                 .replace(/[._\-]+/g, ' ')
                 .replace(/\b\w/g, function(c) { return c.toUpperCase(); })
             : null);
-    const email = user.email
-      || (user.username && user.username.includes('@') ? user.username : null);
+    const email   = user.email || (user.username && user.username.includes('@') ? user.username : null);
     const company = user.company || null;
-    return { displayName: displayName, email: email, company: company };
+    return { displayName, email, company };
   }
 
-  // ── Core send — all identity fields at TOP LEVEL ──────────────
-  // track.py reads email, visitor_name, real_ip directly from the
-  // root of the JSON body — this triggers Hunter enrichment when
-  // email is present, and IPinfo geo for all visitors.
+  // ── Core send — fires to Ospectra backend ──────────────────────
+  // ✅ NOW INCLUDES: device_type, browser, os, ixplane_token
+  // These were missing from v4 — backend + dashboard now show them.
   function send(eventType, extra) {
     extra = extra || {};
     const payload = {
-      visitor_id:   getVid(),
-      session_id:   getSid(),
-      fingerprint:  getFingerprint(),
-      event_type:   eventType,
-      page:         window.location.pathname,
-      referrer:     document.referrer || null,
-      timezone:     Intl.DateTimeFormat().resolvedOptions().timeZone,
-      screen:       screen.width + 'x' + screen.height,
-      element:      extra.element      || null,
-      email:        extra.email        || null,
-      visitor_name: extra.visitor_name || null,
-      real_ip:      _realIP            || null,
+      visitor_id:    getVid(),
+      session_id:    getSid(),
+      fingerprint:   getFingerprint(),
+      event_type:    eventType,
+      page:          window.location.pathname,
+      referrer:      document.referrer || null,
+      timezone:      Intl.DateTimeFormat().resolvedOptions().timeZone,
+      screen:        screen.width + 'x' + screen.height,
+      // ✅ NEW: device/browser/OS now sent (was missing in v4)
+      device_type:   _DEVICE_TYPE,
+      browser:       _BROWSER,
+      os:            _OS,
+      is_mobile:     _DEVICE_TYPE === 'Mobile',
+      // Identity fields — read directly by track.py
+      element:       extra.element      || null,
+      email:         extra.email        || null,
+      visitor_name:  extra.visitor_name || null,
+      real_ip:       _realIP            || null,
+      // ✅ NEW: iXplane token — stored in enrichment_data by backend
+      // Dashboard uses this to show ⚡ iXplane tracking badge
+      ixplane_token: IXPLANE_TOKEN,
       extra: Object.assign({
-        viewport: window.innerWidth + 'x' + window.innerHeight,
-        lang:     navigator.language,
-        real_ip:  _realIP || null,
+        viewport:      window.innerWidth + 'x' + window.innerHeight,
+        lang:          navigator.language,
+        real_ip:       _realIP || null,
+        device_type:   _DEVICE_TYPE,
+        ixplane_token: IXPLANE_TOKEN,
       }, extra),
     };
     fetch(API + '/track', {
@@ -392,15 +532,16 @@ window.addEventListener('popstate', updateActiveNavLink);
 
   window.ospTrack = send;
 
-  // ── 1. Fetch real IP then fire page_view ──────────────────────
+  // ── 1. Fetch real IP then fire page_view ───────────────────────
   fetchRealIP(function(ip) {
     _realIP = ip;
     send('page_view');
+    // ✅ iXplane also gets page view
+    _ixSend('page_view', { real_ip: ip });
   });
 
-  // ── 2. Re-identify returning logged-in users on every page load
-  // Fires user_identified 500ms after page_view with email at top
-  // level — track.py triggers Hunter enrichment for this visitor.
+  // ── 2. Re-identify returning logged-in users on every page load ─
+  // Fires 500ms after page_view — track.py triggers Apollo enrichment.
   (function identifyReturningUser() {
     try {
       const stored = localStorage.getItem('ospectra_user');
@@ -416,12 +557,14 @@ window.addEventListener('popstate', updateActiveNavLink);
           visitor_name: u.displayName,
           company:      u.company,
         });
+        // ✅ iXplane: re-identify on every page load for returning users
+        if (u.email) _ixIdentify(u.email, u.displayName, { source: 'returning_user' });
         console.log('[osp] returning user identified →', u.displayName, u.email);
       }, 500);
     } catch(e) {}
   })();
 
-  // ── 3. Click tracking ─────────────────────────────────────────
+  // ── 3. Click tracking ──────────────────────────────────────────
   document.addEventListener('click', function(e) {
     const el    = e.target.closest('button, a, [data-track]') || e.target;
     const label = (
@@ -438,25 +581,36 @@ window.addEventListener('popstate', updateActiveNavLink);
         element: label.trim(),
         form_id: form ? (form.id || form.className) : null,
       });
+      // ✅ iXplane: button/form click = intent signal
+      _ixSend('form_submit', { element: label.trim() });
     } else {
       send('click', { element: label.trim(), tag: tag, href: el.href || null });
+      // ✅ iXplane: track meaningful clicks (skip single-letter/empty)
+      if (label && label.length > 2) {
+        _ixSend('click', { element: label.trim(), href: el.href || null });
+      }
     }
   });
 
-  // ── 4. Scroll depth ───────────────────────────────────────────
+  // ── 4. Scroll depth ────────────────────────────────────────────
   const scrollFired = {};
   window.addEventListener('scroll', function() {
     const docH = document.documentElement.scrollHeight;
     if (!docH) return;
     const pct = Math.round(((window.scrollY + window.innerHeight) / docH) * 100);
     [25, 50, 75, 90].forEach(function(d) {
-      if (pct >= d && !scrollFired[d]) { scrollFired[d] = true; send('scroll_' + d, { depth: d }); }
+      if (pct >= d && !scrollFired[d]) {
+        scrollFired[d] = true;
+        send('scroll_' + d, { depth: d });
+        // ✅ iXplane: 75%+ scroll = high intent signal
+        if (d >= 75) _ixSend('high_scroll_intent', { depth: d, page: window.location.pathname });
+      }
     });
   }, { passive: true });
 
-  // ── 5. Email capture ──────────────────────────────────────────
-  // When visitor types email and tabs away — fires enrichment
-  // immediately via Hunter email-finder + companies/find.
+  // ── 5. Email capture ───────────────────────────────────────────
+  // When visitor types email and tabs away → triggers Apollo enrichment
+  // in backend (PATH A) for full person + company profile.
   document.addEventListener('change', function(e) {
     const el = e.target;
     if ((el.type === 'email' || el.name === 'email' || el.id === 'email') && el.value) {
@@ -464,10 +618,12 @@ window.addEventListener('popstate', updateActiveNavLink);
         element: 'Email Field',
         email:   el.value.trim(),
       });
+      // ✅ iXplane: identify on email capture — most important signal
+      _ixIdentify(el.value.trim(), null, { source: 'email_field' });
     }
   });
 
-  // ── 6. Name capture ───────────────────────────────────────────
+  // ── 6. Name capture ────────────────────────────────────────────
   document.addEventListener('change', function(e) {
     const el = e.target;
     const ph = (el.placeholder || '').toLowerCase();
@@ -482,7 +638,7 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   });
 
-  // ── 7. Field focus ────────────────────────────────────────────
+  // ── 7. Field focus ─────────────────────────────────────────────
   let focusTimer = null;
   document.addEventListener('focusin', function(e) {
     const el = e.target;
@@ -497,23 +653,28 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   });
 
-  // ── 8. Time on page ───────────────────────────────────────────
+  // ── 8. Time on page ────────────────────────────────────────────
   const timeFired = {};
   [30, 60, 120].forEach(function(sec) {
     setTimeout(function() {
-      if (!timeFired[sec]) { timeFired[sec] = true; send('time_on_page', { seconds: sec }); }
+      if (!timeFired[sec]) {
+        timeFired[sec] = true;
+        send('time_on_page', { seconds: sec });
+        // ✅ iXplane: 120s on page = very high intent
+        if (sec >= 120) _ixSend('high_time_intent', { seconds: sec, page: window.location.pathname });
+      }
     }, sec * 1000);
   });
 
-  // ── 9. Page exit ──────────────────────────────────────────────
+  // ── 9. Page exit ───────────────────────────────────────────────
   window.addEventListener('beforeunload', function() {
     send('page_exit', { element: window.location.pathname });
   });
 
-  // ── 10. Login tracking ────────────────────────────────────────
+  // ── 10. Login tracking ─────────────────────────────────────────
   // Watches localStorage for 'ospectra_user' write (login/signup).
-  // Sends email at top level → track.py triggers Hunter enrichment.
-  // server.js now returns name + email + company on login so
+  // Sends email at top level → track.py triggers Apollo enrichment.
+  // server.js returns name + email + company on login so
   // _extractUser() gets the real name instead of email-prefix guess.
   const _origSetItem = localStorage.setItem.bind(localStorage);
   localStorage.setItem = function(key, value) {
@@ -530,6 +691,11 @@ window.addEventListener('popstate', updateActiveNavLink);
             visitor_name: u.displayName,
             company:      u.company,
           });
+          // ✅ iXplane: login = strongest possible identity signal
+          if (u.email) _ixIdentify(u.email, u.displayName, {
+            event:   'user_login',
+            company: u.company,
+          });
           console.log('[osp] user_login fired →', u.displayName, u.email, u.company);
         }
       } catch(e) {
@@ -538,19 +704,20 @@ window.addEventListener('popstate', updateActiveNavLink);
     }
   };
 
-  // ── 11. Heartbeat every 20s ───────────────────────────────────
-  // Keeps last_seen fresh — dashboard shows LIVE if last_seen < 60s
+  // ── 11. Heartbeat every 20s ────────────────────────────────────
+  // Keeps last_seen fresh — dashboard shows 🟢 LIVE if last_seen < 60s
   setInterval(function() {
     send('heartbeat', { element: window.location.pathname });
   }, 20000);
 
-  // ── 12. SPA navigation ────────────────────────────────────────
+  // ── 12. SPA navigation ─────────────────────────────────────────
   let lastPage = window.location.pathname;
   function checkPageChange() {
     if (window.location.pathname !== lastPage) {
       lastPage = window.location.pathname;
       Object.keys(scrollFired).forEach(function(k) { delete scrollFired[k]; });
       send('page_view');
+      _ixSend('page_view', {});
     }
   }
   setInterval(checkPageChange, 1500);
@@ -560,5 +727,7 @@ window.addEventListener('popstate', updateActiveNavLink);
 
 })();
 // ═══════════════════════════════════════════════════════════════
-// END OF OSPECTRA TRACKER — shared.js v4
+// END OF OSPECTRA TRACKER — shared.js v5
+// iXplane Token:  19d18e9327121ccb5145156fb2b2ec55
+// Apollo enrichment: enrichment.py PATH A (email) / PATH B (IP)
 // ═══════════════════════════════════════════════════════════════
