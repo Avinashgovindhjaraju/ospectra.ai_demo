@@ -1,12 +1,76 @@
 const express    = require('express');
 const bodyParser = require('body-parser');
-const fs         = require('fs');
+const Database   = require('better-sqlite3');
 const path       = require('path');
+const fs         = require('fs');
 
 const app  = express();
 const PORT = 3000;
 
-// ── CORS (for local dev) ──────────────────────────────────────────────────────
+// ── Open (or create) the SQLite database ─────────────────────────────────────
+const DB_PATH = path.join(__dirname, 'ospectra.db');
+const db      = new Database(DB_PATH);
+
+db.pragma('journal_mode = WAL');
+
+// ── Create users table ────────────────────────────────────────────────────────
+db.exec(`
+  CREATE TABLE IF NOT EXISTS users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    username   TEXT    NOT NULL UNIQUE,
+    password   TEXT    NOT NULL,
+    age        TEXT,
+    name       TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )
+`);
+
+// ── One-time migration: users.json → SQLite ───────────────────────────────────
+const USERS_JSON = path.join(__dirname, 'users.json');
+if (fs.existsSync(USERS_JSON)) {
+  try {
+    const jsonUsers = JSON.parse(fs.readFileSync(USERS_JSON, 'utf8'));
+    const insert = db.prepare(`
+      INSERT OR IGNORE INTO users (username, password, age, name)
+      VALUES (@username, @password, @age, @name)
+    `);
+    const importMany = db.transaction((users) => {
+      for (const u of users) {
+        insert.run({
+          username: u.username,
+          password: u.password,
+          age:      u.age  || null,
+          name:     u.name || null,
+        });
+      }
+    });
+    importMany(jsonUsers);
+    console.log(`[db] Migrated ${jsonUsers.length} user(s) from users.json → ospectra.db`);
+    fs.renameSync(USERS_JSON, USERS_JSON + '.migrated');
+    console.log('[db] users.json renamed to users.json.migrated');
+  } catch (err) {
+    console.warn('[db] Migration warning:', err.message);
+  }
+}
+
+// ── Prepared statements ───────────────────────────────────────────────────────
+const stmtFindUser   = db.prepare('SELECT * FROM users WHERE username = ?');
+const stmtInsertUser = db.prepare(`
+  INSERT INTO users (username, password, age, name)
+  VALUES (@username, @password, @age, @name)
+`);
+
+// ── Helper: display name from name field or email prefix ─────────────────────
+function deriveDisplayName(user) {
+  if (user.name && user.name.trim().length > 1) return user.name.trim();
+  const prefix = (user.username || '').split('@')[0];
+  return prefix
+    .replace(/[._-]+/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase())
+    .trim();
+}
+
+// ── CORS ──────────────────────────────────────────────────────────────────────
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
@@ -17,82 +81,75 @@ app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
 app.use(express.static(path.join(__dirname)));
 
-const USERS_FILE = path.join(__dirname, 'users.json');
-
-function readUsers() {
-  if (!fs.existsSync(USERS_FILE)) return [];
-  return JSON.parse(fs.readFileSync(USERS_FILE, 'utf8'));
-}
-
-function writeUsers(users) {
-  fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-}
-
-// ── Helper: derive a display name from email or name field ───────────────────
-// "avinash.govindharaju@ospectra.ai" → "Avinash Govindharaju"
-function deriveDisplayName(user) {
-  // If they filled in a real name during signup, use that
-  if (user.name && user.name.trim().length > 1) return user.name.trim();
-  // Fall back to email prefix, clean it up
-  const prefix = (user.username || '').split('@')[0];           // "avinash.govindharaju"
-  return prefix
-    .replace(/[._-]+/g, ' ')                                    // "avinash govindharaju"
-    .replace(/\b\w/g, c => c.toUpperCase())                     // "Avinash Govindharaju"
-    .trim();
-}
-
 // ── POST /api/login ───────────────────────────────────────────────────────────
 app.post('/api/login', (req, res) => {
   const { username, password } = req.body;
-  const users = readUsers();
-  const user  = users.find(u => u.username === username && u.password === password);
 
-  if (user) {
-    // ✅ Return full profile so the frontend can pass it to ospTrack
-    res.json({
-      success:      true,
-      message:      'Login successful',
-      username:     user.username,          // email used as username
-      name:         deriveDisplayName(user),// human-readable name
-      email:        user.username,          // explicit email field
-      age:          user.age,
-      company:      user.company  || null,  // if you add company to users.json later
-      phone:        user.phone    || null,
-    });
-  } else {
-    res.json({ success: false, message: 'User not found or wrong password' });
+  if (!username || !password) {
+    return res.json({ success: false, message: 'Email and password are required.' });
   }
+
+  const user = stmtFindUser.get(username);
+
+  if (user && user.password === password) {
+    return res.json({
+      success:  true,
+      message:  'Login successful',
+      username: user.username,
+      name:     deriveDisplayName(user),
+      email:    user.username,
+      age:      user.age,
+    });
+  }
+
+  res.json({ success: false, message: 'User not found or wrong password.' });
 });
 
 // ── POST /api/signup ──────────────────────────────────────────────────────────
 app.post('/api/signup', (req, res) => {
-  const { username, password, age, name, company, phone } = req.body;
-  let users = readUsers();
+  const { username, password, age, name } = req.body;
 
-  if (users.find(u => u.username === username)) {
-    return res.json({ success: false, message: 'User already exists' });
+  if (!username || !password) {
+    return res.json({ success: false, message: 'Email and password are required.' });
   }
 
-  // ✅ Store extra fields if provided (name, company, phone)
-  const newUser = { username, password, age };
-  if (name)    newUser.name    = name.trim();
-  if (company) newUser.company = company.trim();
-  if (phone)   newUser.phone   = phone.trim();
+  const existing = stmtFindUser.get(username);
+  if (existing) {
+    return res.json({ success: false, message: 'User already exists.' });
+  }
 
-  users.push(newUser);
-  writeUsers(users);
+  try {
+    stmtInsertUser.run({
+      username,
+      password,
+      age:  age  || null,
+      name: name ? name.trim() : null,
+    });
 
-  res.json({
-    success:  true,
-    message:  'Sign up successful',
-    username: username,
-    name:     deriveDisplayName(newUser),
-    email:    username,
-    age:      age,
-    company:  newUser.company || null,
-  });
+    const newUser = stmtFindUser.get(username);
+    return res.json({
+      success:  true,
+      message:  'Sign up successful',
+      username: newUser.username,
+      name:     deriveDisplayName(newUser),
+      email:    newUser.username,
+      age:      newUser.age,
+    });
+  } catch (err) {
+    console.error('[signup] error:', err.message);
+    return res.json({ success: false, message: 'Signup failed. Please try again.' });
+  }
+});
+
+// ── GET /api/users (debug — remove in production) ────────────────────────────
+app.get('/api/users', (req, res) => {
+  const users = db.prepare(
+    'SELECT id, username, age, name, created_at FROM users'
+  ).all();
+  res.json(users);
 });
 
 app.listen(PORT, () => {
   console.log(`Server running on http://localhost:${PORT}`);
+  console.log(`Database: ${DB_PATH}`);
 });
